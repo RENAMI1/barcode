@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Scanner Barcode Quagga2</title>
+    <script src="https://unpkg.com/@ericblade/quagga2@1.7.4/dist/quagga.min.js"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f4f4f4;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }
+        h2 { color: #333; }
+        
+        /* Container Kamera */
+        #interactive {
+            position: relative;
+            width: 100%;
+            max-width: 640px;
+            height: 480px;
+            overflow: hidden;
+            background: #000;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+
+        /* Video dan Canvas Overlay agar tumpuknya pas */
+        #interactive > video, #interactive > canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        /* Area Hasil Scan */
+        #result-area {
+            margin-top: 20px;
+            padding: 15px;
+            background: white;
+            border-radius: 8px;
+            width: 100%;
+            max-width: 600px;
+            text-align: center;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        .code-text { font-size: 1.5em; font-weight: bold; color: #2ecc71; }
+        .format-text { font-size: 0.9em; color: #7f8c8d; }
+
+        /* Garis Overlay (Visualisasi Kotak Hijau) */
+        .drawingBuffer {
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+    </style>
+</head>
+<body>
+
+    <h2>Scanner Gudang (Quagga2)</h2>
+    
+    <div id="interactive" class="viewport"></div>
+
+    <div id="result-area">
+        <p>Arahkan kamera ke barcode batang...</p>
+        <div id="scanned-code" class="code-text">-</div>
+        <div id="scanned-format" class="format-text">Format: -</div>
+    </div>
+
+    <script>
+        // Variabel untuk mencegah scan berulang-ulang dalam waktu singkat
+        let lastScanCode = null;
+        let lastScanTime = 0;
+        let detectionCount = 0;  // Hitung deteksi berturut-turut untuk multiRead
+
+        // Fungsi validasi kode: Cek panjang minimal dan format (numerik/alphanumerik)
+        function isValidCode(code, format) {
+            if (!code || code.length < 3) return false;  // Minimal 3 karakter
+            // Contoh validasi: Jika EAN, harus numerik; Code128 bisa alphanumerik
+            if (format.includes('ean') && !/^\d+$/.test(code)) return false;
+            if (format.includes('code_128') && !/^[A-Za-z0-9\-]+$/.test(code)) return false;
+            return true;
+        }
+
+        // Fungsi untuk cek HTTPS (diperlukan untuk kamera)
+        function isSecureContext() {
+            return window.location.protocol === 'https:' || window.location.hostname === 'localhost';
+        }
+
+        // Fungsi untuk inisialisasi scanner dengan fallback kamera
+        function startScanner(cameraMode = "environment") {
+            if (!isSecureContext()) {
+                alert("Kamera memerlukan HTTPS. Akses halaman ini via https:// atau localhost.");
+                return;
+            }
+
+            Quagga.init({
+                inputStream: {
+                    name: "Live",
+                    type: "LiveStream",
+                    target: document.querySelector('#interactive'), // Target div
+                    constraints: {
+                        width: 640,
+                        height: 480,
+                        facingMode: cameraMode,  // Coba belakang dulu, fallback depan
+                        aspectRatio: 4/3,
+                        frameRate: { ideal: 30, max: 30 }  // Stabil di mobile
+                    },
+                    skipFrame: 2  // Lewatkan frame untuk performa
+                },
+                locator: {
+                    patchSize: "medium",
+                    halfSample: true,
+                    frequency: 0.3,  // Kurangi noise
+                    minSideLength: 0.1,
+                    maxSideLength: 0.9
+                },
+                numOfWorkers: 2,
+                decoder: {
+                    readers: [
+                        "code_128_reader", // Prioritas utama
+                        "ean_reader",
+                        "ean_8_reader",
+                        "code_39_reader"
+                    ],
+                    tryHarder: true,
+                    threshold: 0.9,  // Hanya kode dengan confidence >90%
+                    multiRead: true   // Perlu beberapa deteksi sebelum konfirmasi
+                },
+                locate: true,
+                debug: false,
+                showPatternBars: false
+            }, function (err) {
+                if (err) {
+                    console.log("Error inisialisasi kamera (" + cameraMode + "):", err);
+                    if (cameraMode === "environment") {
+                        // Fallback ke kamera depan jika belakang gagal
+                        console.log("Mencoba kamera depan...");
+                        startScanner("user");
+                    } else {
+                        alert("Gagal mengakses kamera. Pastikan beri izin kamera di browser, dan coba refresh halaman. Error: " + err.message);
+                    }
+                    return;
+                }
+                console.log("Inisialisasi selesai dengan kamera " + cameraMode + ". Mulai scanning...");
+                Quagga.start();
+            });
+
+            // Event Listener: Saat barcode terdeteksi tapi belum final (Visualisasi Kotak)
+            Quagga.onProcessed(function (result) {
+                var drawingCtx = Quagga.canvas.ctx.overlay,
+                    drawingCanvas = Quagga.canvas.dom.overlay;
+
+                if (result) {
+                    if (result.boxes) {
+                        drawingCtx.clearRect(0, 0, parseInt(drawingCanvas.getAttribute("width")), parseInt(drawingCanvas.getAttribute("height")));
+                        result.boxes.filter(function (box) {
+                            return box !== result.box;
+                        }).forEach(function (box) {
+                            Quagga.ImageDebug.drawPath(box, { x: 0, y: 1 }, drawingCtx, { color: "green", lineWidth: 2 });
+                        });
+                    }
+
+                    if (result.box) {
+                        Quagga.ImageDebug.drawPath(result.box, { x: 0, y: 1 }, drawingCtx, { color: "#00F", lineWidth: 2 });
+                    }
+
+                    if (result.codeResult && result.codeResult.code) {
+                        Quagga.ImageDebug.drawPath(result.line, { x: 'x', y: 'y' }, drawingCtx, { color: 'red', lineWidth: 3 });
+                    }
+                }
+            });
+
+            // Event Listener: Saat scan BERHASIL
+            Quagga.onDetected(function (result) {
+                var code = result.codeResult.code;
+                var format = result.codeResult.format;
+                var currentTime = Date.now();
+
+                // Validasi kode terlebih dahulu
+                if (!isValidCode(code, format)) {
+                    console.log("Kode tidak valid, diabaikan: " + code);
+                    return;
+                }
+
+                // Hitung deteksi berturut-turut (untuk multiRead simulasi)
+                if (code === lastScanCode) {
+                    detectionCount++;
+                } else {
+                    detectionCount = 1;
+                    lastScanCode = code;
+                }
+
+                // Konfirmasi hanya jika deteksi >= 3 kali dan debounce waktu
+                if (detectionCount >= 3 && (currentTime - lastScanTime) > 1000) {
+                    lastScanTime = currentTime;
+                    
+                    // Tampilkan di layar
+                    document.getElementById('scanned-code').innerText = code;
+                    document.getElementById('scanned-format').innerText = format;
+
+                    console.log("Barcode terdeteksi dan dikonfirmasi: " + code);
+                    
+                    // Reset setelah 5 detik
+                    setTimeout(() => { 
+                        lastScanCode = null; 
+                        detectionCount = 0; 
+                    }, 5000);
+                }
+            });
+        }
+
+        // Jalankan Scanner saat halaman dimuat
+        document.addEventListener('DOMContentLoaded', function() {
+            // Listener untuk orientasi layar (mobile)
+            window.addEventListener('orientationchange', function() {
+                console.log("Orientasi berubah, restart scanner...");
+                Quagga.stop();  // Stop dulu
+                setTimeout(() => startScanner(), 500);  // Restart setelah delay
+            });
+
+            startScanner();  // Mulai dengan kamera belakang
+        });
+    </script>
+</body>
+</html>
